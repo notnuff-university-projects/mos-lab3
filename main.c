@@ -1,207 +1,142 @@
-// Виконав Ярошенко Олександр Сергійович
-// Група ІМ-21
-// Варіант: 29 - 25 = 4
-
-/*
-* Виведіть списком 10 дат, відсортованих за кількістю звертань (до 10
-* елементів списку, починаючи з найбільшого значення, в порядку спадання), з
-* рядками у форматі <дата> - <кількість звертань в цю дату, числом> - <відсоток
-* цієї кількості від загальної кількості звертань за всі ці дати>
- */
-
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/wait.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <time.h>
 
-// extracts date and puts it
-// in external outBuffer to avoid memory leaks
-// this function actually uses pipes and
-// commands like grep to perform extraction
-void extractDate(const char* inLine, char** outBuffer /*damn, I miss pass-by-reference from C++*/, size_t* outBufferSize);
-void writeToTempFile(const char* line);
-
-
-
-int main(int argc, char *argv[]) {
-
-    // 1. extract file we want to use from command line
-    if (argc != 2) {
-        perror("Input error!\n");
-        fprintf(stderr, "Usage: lab3 <file>\n");
-        exit(1);
-    }
-
-    FILE *file = fopen(argv[1], "r");
-    if (!file) {
-        perror("Failed to open file");
-        exit(1);
-    }
-
-    char *lineBuffer = NULL;
-    size_t lineBufferSize = 0;
-
-    char *dateBuffer = NULL;
-    size_t dateBufferSize = 0;
-
-    // getline automatically allocates buffer for the line if current is not big enough
-    while (getline(&lineBuffer, &lineBufferSize, file) != -1) {
-        extractDate(lineBuffer, &dateBuffer, &dateBufferSize);
-
-        printf("Date: %s", dateBuffer);
-    }
-
-    free(lineBuffer);
-    free(dateBuffer);
-    fclose(file);
-
-    return 0;
+void error_and_exit(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-void extractDate(const char* inLine, char** outBuffer /*damn, I miss pass-by-reference from C++*/, size_t* outBufferSize) {
-    // pipe file descriptors for grep and trunkate
+int launch_stage(const char *cmd, char *const argv[], int input_fd, int *output_fd) {
+    int pipe_fd[2];
+    if (pipe(pipe_fd) == -1) error_and_exit("pipe");
 
-    int parentToGrepPipe[2];
-    int grepToTrPipe[2];
-    int trToParentPipe[2];
+    pid_t pid = fork();
+    if (pid == -1) error_and_exit("fork");
 
-    // process id's for grep and tr commands
-    pid_t pidGrep, pidTr;
-
-    if (pipe(parentToGrepPipe) == -1) {
-        perror("failed to create pipe [inLine out->in grep]");
-        exit(1);
-    }
-
-    if (pipe(grepToTrPipe) == -1) {
-        perror("failed to create pipe [grep out->in tr]");
-        exit(1);
-    }
-
-    if (pipe(trToParentPipe) == -1) {
-        perror("failed to create pipe [tr out->in parent]");
-        exit(1);
-    }
-
-    pidGrep = fork();
-    if (pidGrep == -1) {
-        perror("failed to create fork for grep");
-        exit(1);
-    }
-
-    if (pidGrep == 0) {
-        {
-            close(parentToGrepPipe[1]);
-
-            dup2(parentToGrepPipe[0], STDIN_FILENO);
-            close(parentToGrepPipe[0]);
+    if (pid == 0) {
+        if (input_fd != -1) {
+            dup2(input_fd, STDIN_FILENO);
+            close(input_fd);
         }
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
 
-        {
-            // closing both ends of unused pipe here
-            close(trToParentPipe[0]); close(trToParentPipe[1]);
-        }
-
-        {
-            // closing unused pipe end (read) in fork,
-            // it is obligatory to avoid signaling end of file incorrectly
-            close(grepToTrPipe[0]);
-
-            // redirect output from grep to the pipe
-            dup2(grepToTrPipe[1], STDOUT_FILENO);
-            close(grepToTrPipe[1]);
-        }
-
-        // assembling the grep command like in bash script
-        char *grepAssembly[] = {
-            "grep",
-            "-oP",
-            R"((?<= - - \[)[0-9]{2}/[A-Za-z]{3}/[0-9]{4})",
-            NULL
-        };
-        execvp("grep", grepAssembly);
-
-        // we should newer hit this
-        perror("execution of grep failed");
-        exit(1);
+        execvp(cmd, argv);
+        error_and_exit(cmd);
     }
 
-    pidTr = fork();
-    if (pidTr == -1) {
-        perror("fork (tr) failed");
-        exit(1);
+    if (input_fd != -1) close(input_fd);
+    close(pipe_fd[1]);
+    *output_fd = pipe_fd[0];
+    return pid;
+}
+
+int run_grep(int input_fd, int *output_fd) {
+    char *args[] = {"grep", "-oP", "(?<= - - \\[)[0-9]{2}/[A-Za-z]{3}/[0-9]{4}", NULL};
+    return launch_stage("grep", args, input_fd, output_fd);
+}
+
+int run_tr(int input_fd, int *output_fd) {
+    char *args[] = {"tr", "-d", "/", NULL};
+    return launch_stage("tr", args, input_fd, output_fd);
+}
+
+int run_date_format(int input_fd, int *output_fd) {
+    char *args[] = {"xargs", "-I{}", "date", "-d", "{}", "+%Y-%m-%d", NULL};
+    return launch_stage("xargs", args, input_fd, output_fd);
+}
+
+int run_sort(int input_fd, int *output_fd) {
+    char *args[] = {"sort", NULL};
+    return launch_stage("sort", args, input_fd, output_fd);
+}
+
+int run_uniq_count(int input_fd, int *output_fd) {
+    char *args[] = {"uniq", "-c", NULL};
+    return launch_stage("uniq", args, input_fd, output_fd);
+}
+
+int run_sort_count_desc(int input_fd, int *output_fd) {
+    char *args[] = {"sort", "-k1", "-nr", NULL};
+    return launch_stage("sort", args, input_fd, output_fd);
+}
+
+int run_head10(int input_fd, int *output_fd) {
+    char *args[] = {"head", "-n", "10", NULL};
+    return launch_stage("head", args, input_fd, output_fd);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <log_file>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    if (pidTr == 0) {
-        {
-            close(parentToGrepPipe[1]); close(parentToGrepPipe[0]);
-        }
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
 
-        {
-            close(grepToTrPipe[1]);
+    // Open log file
+    int input_fd = open(argv[1], O_RDONLY);
+    if (input_fd == -1) error_and_exit("open");
 
-            // redirect read end from the pipe to input
-            dup2(grepToTrPipe[0], STDIN_FILENO);
-            close(grepToTrPipe[0]);
-        }
+    int out_fd;
 
-        {
-            // closing read end of pipe to parent
-            close(trToParentPipe[0]);
+    pid_t pids[10]; int pid_count = 0;
 
-            dup2(trToParentPipe[1], STDOUT_FILENO);
-            close(trToParentPipe[1]);
-        }
+    pids[pid_count++] = run_grep(input_fd, &out_fd);
+    pids[pid_count++] = run_tr(out_fd, &out_fd);
+    pids[pid_count++] = run_date_format(out_fd, &out_fd);
+    pids[pid_count++] = run_sort(out_fd, &out_fd);
+    pids[pid_count++] = run_uniq_count(out_fd, &out_fd);
+    pids[pid_count++] = run_sort_count_desc(out_fd, &out_fd);
+    pids[pid_count++] = run_head10(out_fd, &out_fd);
 
-        // assembling the tr command
-        char *trAssembly[] = {
-            "tr",
-            "-d",
-            "/",
-            NULL
-        };
-        execvp("tr", trAssembly);
+    FILE *final = fdopen(out_fd, "r");
+    if (!final) error_and_exit("fdopen");
 
-        // we should newer hit this either
-        perror("execution of tr failed");
-        exit(1);
+    char *line = NULL;
+    size_t len = 0;
+    int total_hits = 0, hits[10] = {0};
+    char dates[10][64];
+    int count = 0;
+
+    while(getline(&line, &len, final) != -1 && count < 10) {
+        char *token = strtok(line, " \t\n");
+        if (!token) continue;
+
+        hits[count] = (int) strtol(token, NULL, 10);
+
+        token = strtok(NULL, " \t\n");
+        if (!token) continue;
+
+        strncpy(dates[count], token, sizeof(dates[count]) - 1);
+        dates[count][sizeof(dates[count]) - 1] = '\0';
+
+        total_hits += hits[count];
+        count++;
     }
 
-    // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    fclose(final);
+    free(line);
 
-    {
-        close(parentToGrepPipe[0]);
-        write(parentToGrepPipe[1], inLine, strlen(inLine));
-
-        // we are closing write end here to signal EOF
-        close(parentToGrepPipe[1]);
+    for (int i = 0; i < count; ++i) {
+        int percent = hits[i] * 100 / total_hits;
+        printf("%d. %s - %d - %d%%\n", i + 1, dates[i], hits[i], percent);
     }
 
-    {
-        // closing both ends of pipe in parent process,
-        // as we will not need them here
-        close(grepToTrPipe[0]); close(grepToTrPipe[1]);
-    }
+    // wait for all commands we are running
+    for (int i = 0; i < pid_count; ++i) waitpid(pids[i], NULL, 0);
 
-    {
-        // also closing unused write end of pipe from tr
-        close(trToParentPipe[1]);
-    }
+    // measuring execution time
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double duration = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("\nЧас виконання: %.2f секунд\n", duration);
 
-    // Wait for both children to finish
-    waitpid(pidGrep, NULL, 0);
-    waitpid(pidTr, NULL, 0);
-
-    // converting tr write pipe output to file so we could read it with getline
-    // it will read only one line, but the cool part is that we don't need any buffers and our memory is safe
-    FILE *pipe_stream = fdopen(trToParentPipe[0], "r");
-
-    if (getline(outBuffer, outBufferSize, pipe_stream) == -1) {
-        fprintf(stderr, "Failed to extract date: %s\n", *outBuffer);
-    }
-
-    fclose(pipe_stream);
-    close(trToParentPipe[0]);
+    return 0;
 }
